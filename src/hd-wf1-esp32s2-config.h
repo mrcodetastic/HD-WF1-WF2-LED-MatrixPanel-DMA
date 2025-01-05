@@ -1,15 +1,4 @@
 // -------------------------------------------
-// Wifi Configuration
-
-const char *wifi_ssid = "xxxx";
-const char *wifi_pass = "yyyy";
-
-// -------------------------------------------
-// Clock Offset
-
-#define CLOCK_GMT_OFFSET 1
-
-// -------------------------------------------
 // WF1 GPIO Configuration
 
 #define RUN_LED_PIN       40
@@ -19,6 +8,7 @@ const char *wifi_pass = "yyyy";
 #define BM8563_I2C_SDA    41
 #define BM8563_I2C_SCL    42
 
+// HUB75 Pins
 #define WF1_R1_PIN 2
 #define WF1_R2_PIN 4
 #define WF1_G1_PIN 6

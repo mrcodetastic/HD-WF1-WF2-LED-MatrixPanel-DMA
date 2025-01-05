@@ -1,6 +1,16 @@
-// Pin Definitions for the Huidu HUB75 Series Control Card:  HD-WF1
-// https://www.aliexpress.com/item/1005005038544582.html can be got for about $5 USD
-#include "hd-wf1-esp32s2-config.h"
+// Custom LED Matrix Firmware (leveraging the HUB75 DMA library) for the Huidu HUB75 Series Control Cards.
+// Example shop link: https://www.aliexpress.com/item/1005005038544582.html -> WF1
+// Example shop link: https://www.aliexpress.com/item/1005002271988988.html -> WF2
+
+#if defined(WF1)
+  #include "hd-wf1-esp32s2-config.h"
+#elif defined(WF2)
+  #include "hd-wf2-esp32s3-config.h"
+#else
+  #error "Please define either WF1 or WF2"
+#endif  
+
+
 #include <esp_err.h>
 #include <esp_log.h>
 #include "debug.h"
@@ -25,19 +35,36 @@
 
 #define fs LittleFS
 
+/*----------------------------- Wifi Configuration -------------------------------*/
+
+const char *wifi_ssid = "xxxx";
+const char *wifi_pass = "yyyy";
 
 /*----------------------------- RTC and NTP -------------------------------*/
+
 I2C_BM8563 rtc(I2C_BM8563_DEFAULT_ADDRESS, Wire1);
 const char* ntpServer         = "time.cloudflare.com";
 const char* ntpLastUpdate     = "/ntp_last_update.txt";
 
+// NTP Clock Offset / Timezone
+#define CLOCK_GMT_OFFSET 1
 
 /*-------------------------- HUB75E DMA Setup -----------------------------*/
 #define PANEL_RES_X 64      // Number of pixels wide of each INDIVIDUAL panel module. 
 #define PANEL_RES_Y 32     // Number of pixels tall of each INDIVIDUAL panel module.
 #define PANEL_CHAIN 1      // Total number of panels chained one to another
 
+
+#if defined(WF1)
+
 HUB75_I2S_CFG::i2s_pins _pins_x1 = {WF1_R1_PIN, WF1_G1_PIN, WF1_B1_PIN, WF1_R2_PIN, WF1_G2_PIN, WF1_B2_PIN, WF1_A_PIN, WF1_B_PIN, WF1_C_PIN, WF1_D_PIN, WF1_E_PIN, WF1_LAT_PIN, WF1_OE_PIN, WF1_CLK_PIN};
+
+#else
+
+HUB75_I2S_CFG::i2s_pins _pins_x1 = {WF2_X1_R1_PIN, WF2_X1_G1_PIN, WF2_X1_B1_PIN, WF2_X1_R2_PIN, WF2_X1_G2_PIN, WF2_X1_B2_PIN, WF2_A_PIN, WF2_B_PIN, WF2_C_PIN, WF2_D_PIN, WF2_X1_E_PIN, WF2_LAT_PIN, WF2_OE_PIN, WF2_CLK_PIN};
+HUB75_I2S_CFG::i2s_pins _pins_x2 = {WF2_X2_R1_PIN, WF2_X2_G1_PIN, WF2_X2_B1_PIN, WF2_X2_R2_PIN, WF2_X2_G2_PIN, WF2_X2_B2_PIN, WF2_A_PIN, WF2_B_PIN, WF2_C_PIN, WF2_D_PIN, WF2_X2_E_PIN, WF2_LAT_PIN, WF2_OE_PIN, WF2_CLK_PIN};
+
+#endif
 
 
 /*-------------------------- Class Instances ------------------------------*/
