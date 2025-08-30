@@ -28,7 +28,7 @@
 #include <I2C_BM8563.h>   // https://github.com/tanakamasayuki/I2C_BM8563
 
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
-#include <ElegantOTA.h> // upload firmware by going to http://<ipaddress>/update
+//#include <ElegantOTA.h> // upload firmware by going to http://<ipaddress>/update
 
 #include <ESP32Time.h>
 #include <Bounce2.h>
@@ -192,14 +192,39 @@ unsigned long getEpochTime() {
   return now;
 }
 
+// Check if RTC has valid date/time
+bool isRTCTimeValid(const I2C_BM8563_DateTypeDef &date, const I2C_BM8563_TimeTypeDef &time) {
+  // Check reasonable year range (2020-2099)
+  if (date.year < 2020 || date.year > 2099) {
+    return false;
+  }
+  // Check month range
+  if (date.month < 1 || date.month > 12) {
+    return false;
+  }
+  // Check day range
+  if (date.date < 1 || date.date > 31) {
+    return false;
+  }
+  // Check hour range
+  if (time.hours > 23) {
+    return false;
+  }
+  // Check minute/second range
+  if (time.minutes > 59 || time.seconds > 59) {
+    return false;
+  }
+  return true;
+}
+
 // Get time from external RTC as fallback
 bool getRTCTime(struct tm* timeinfo) {
   I2C_BM8563_DateTypeDef rtcDate;
   I2C_BM8563_TimeTypeDef rtcTime;
   
-  if (!rtc.getDate(&rtcDate) || !rtc.getTime(&rtcTime)) {
-    return false;
-  }
+  // Get date and time from RTC (these are void functions)
+  rtc.getDate(&rtcDate);
+  rtc.getTime(&rtcTime);
   
   if (!isRTCTimeValid(rtcDate, rtcTime)) {
     return false;
@@ -227,31 +252,6 @@ bool getTimeWithFallback(struct tm* timeinfo) {
   // Fallback to external RTC
   Serial.println("ESP32 RTC failed, trying external RTC...");
   return getRTCTime(timeinfo);
-}
-
-// Check if RTC has valid date/time
-bool isRTCTimeValid(const I2C_BM8563_DateTypeDef &date, const I2C_BM8563_TimeTypeDef &time) {
-  // Check reasonable year range (2020-2099)
-  if (date.year < 2020 || date.year > 2099) {
-    return false;
-  }
-  // Check month range
-  if (date.month < 1 || date.month > 12) {
-    return false;
-  }
-  // Check day range
-  if (date.date < 1 || date.date > 31) {
-    return false;
-  }
-  // Check hour range
-  if (time.hours > 23) {
-    return false;
-  }
-  // Check minute/second range
-  if (time.minutes > 59 || time.seconds > 59) {
-    return false;
-  }
-  return true;
 }
 
 // Function declarations
@@ -402,15 +402,12 @@ void setup() {
   I2C_BM8563_DateTypeDef rtcDate;
   I2C_BM8563_TimeTypeDef rtcTime;
   
-  // Try to read RTC with error handling
-  bool rtcReadSuccess = true;
-  if (!rtc.getDate(&rtcDate) || !rtc.getTime(&rtcTime)) {
-    Serial.println("Failed to read from RTC");
-    rtcReadSuccess = false;
-  }
+  // Try to read RTC - these functions return void, so we can't check their return values
+  rtc.getDate(&rtcDate);
+  rtc.getTime(&rtcTime);
   
-  // Validate RTC data if read was successful
-  bool rtcDataValid = rtcReadSuccess && isRTCTimeValid(rtcDate, rtcTime);
+  // Validate RTC data
+  bool rtcDataValid = isRTCTimeValid(rtcDate, rtcTime);
   
   if (rtcDataValid) {
     Serial.printf("RTC Date: %04d-%02d-%02d %02d:%02d:%02d\n", 
@@ -475,30 +472,26 @@ void setup() {
       if (getLocalTime(&timeInfo)) {
         Serial.println("\nNTP sync successful");
         
-        // Set RTC time
+        // Set RTC time - setTime returns void, so we can't check its return value
         I2C_BM8563_TimeTypeDef timeStruct;
         timeStruct.hours   = timeInfo.tm_hour;
         timeStruct.minutes = timeInfo.tm_min;
         timeStruct.seconds = timeInfo.tm_sec;
         
-        if (!rtc.setTime(&timeStruct)) {
-          Serial.println("Failed to set RTC time");
-        }
+        rtc.setTime(&timeStruct);
+        Serial.println("RTC time set successfully");
 
-        // Set RTC Date
+        // Set RTC Date - setDate returns void, so we can't check its return value
         I2C_BM8563_DateTypeDef dateStruct;
         dateStruct.weekDay = timeInfo.tm_wday;
         dateStruct.month   = timeInfo.tm_mon + 1;
         dateStruct.date    = timeInfo.tm_mday;
         dateStruct.year    = timeInfo.tm_year + 1900;
         
-        if (!rtc.setDate(&dateStruct)) {
-          Serial.println("Failed to set RTC date");
-        } else {
-          Serial.printf("RTC updated to: %04d-%02d-%02d %02d:%02d:%02d\n",
-                        dateStruct.year, dateStruct.month, dateStruct.date,
-                        timeStruct.hours, timeStruct.minutes, timeStruct.seconds);
-        }
+        rtc.setDate(&dateStruct);
+        Serial.printf("RTC updated to: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      dateStruct.year, dateStruct.month, dateStruct.date,
+                      timeStruct.hours, timeStruct.minutes, timeStruct.seconds);
         
         // Update local variables with new time
         rtcDate = dateStruct;
@@ -540,7 +533,7 @@ void setup() {
       webServer.send(200, "text/plain", "Hi! I am here.");
     });
 
-    ElegantOTA.begin(&webServer);    // Start ElegantOTA
+    //ElegantOTA.begin(&webServer);    // Start ElegantOTA
     webServer.begin();
     Serial.println("OTA HTTP server started");
 
