@@ -4,6 +4,14 @@ Custom firmware based on my [HUB75 DMA library](https://github.com/mrfaptastic/E
 * Huidu WF1 LED Controller Card based on the ESP32-S2; or
 * Huidu WF2 LED Controller Card based on the ESP32-S3.
 
+## Features
+- **Multiple Display Modes**: Three different visual modes accessible via button control
+- **Robust Real-Time Clock**: Enhanced RTC handling with NTP synchronization, data validation, and automatic fallback
+- **Deep Sleep Support**: Power-saving sleep mode with button wake-up
+- **WiFi Connectivity**: OTA firmware updates via web interface
+- **Debounced Button Control**: Reliable button handling with short/long press detection
+- **Animated Graphics**: Colorful animations and bouncing effects
+
 ## Huidu WF1
 These can be bought for about USD $5 and are quite good as they come with a battery and a Real Time Clock (BM8563), and a push button connected to GPIO 11 for your use.
  
@@ -52,6 +60,32 @@ Limitations:
 [Source](https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA/discussions/667#discussioncomment-10438431)
 
 ## GitHub Sketch Output
-It should show a clock and some colourful graphics. Designed for a 64x32px LED matrix.
+The firmware features multiple display modes that can be cycled through using the onboard push button:
+
+### Display Modes
+1. **Clock with Animation** (Default) - Shows time and date with colorful animated background
+2. **Clock Only** - Clean time and date display with no background animation
+3. **Bouncing Squares** - Animated bouncing squares with time overlay
+
+### Button Controls
+- **Short Press** (< 2 seconds): Cycles through the display modes
+- **Long Press** (> 2 seconds): Puts the device into deep sleep mode
+
+The device will wake up from deep sleep when the button is pressed again.
+
+### Technical Details
+- Uses Bounce2 library for reliable button debouncing
+- Button state is monitored continuously in the main loop
+- Deep sleep preserves battery life when the display is not needed
+- All three display modes maintain accurate timekeeping
+- Bouncing squares animation uses physics-based collision detection
+- **Enhanced RTC Management**:
+  - Automatic data validation for RTC readings
+  - NTP synchronization every 7 days (configurable)
+  - Fallback from ESP32 internal RTC to external BM8563 RTC
+  - Error handling and recovery for corrupted time data
+  - Detailed logging of time synchronization events
+
+Designed for a 64x32px LED matrix panel.
 
 ![image](https://github.com/user-attachments/assets/d7293beb-f293-4741-9fbf-6555be1db297)
