@@ -4,7 +4,7 @@
 //       You can only use wither the 75EX1 or 75EX1 port at any time to drive a single HUB75 panel, or a chain of panels.
 
 #define RUN_LED_PIN       40
-#define PUSH_BUTTON_PIN   11
+#define PUSH_BUTTON_PIN   17
 
 // I2C RTC BM8563 I2C port
 #define BM8563_I2C_SDA    41
