@@ -13,27 +13,35 @@
 
 #include <esp_err.h>
 #include <esp_log.h>
+#include <esp_sntp.h>
+#include <sys/time.h>
 #include "debug.h"
 #include "littlefs_core.h"
 #include <ctime>
 #include "driver/ledc.h"
+#include "driver/rtc_io.h"
 
 #include <Arduino.h>
+#include <new>
 #include <WiFi.h>
 #include <WiFiMulti.h>
-#include <HTTPClient.h>
 
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <I2C_BM8563.h>   // https://github.com/tanakamasayuki/I2C_BM8563
 
+// WiFi credentials are kept out of source control. Copy
+// src/secrets.h.example to src/secrets.h and fill in your own values.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+// OTA is optional. To enable it, uncomment the include and the
+// ElegantOTA.begin() call below and add the ElegantOTA dependency.
 //#include <ElegantOTA.h> // upload firmware by going to http://<ipaddress>/update
 
-#include <ESP32Time.h>
 #include <Bounce2.h>
-
-#define fs LittleFS
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -41,8 +49,14 @@
 
 /*----------------------------- Wifi Configuration -------------------------------*/
 
-const char *wifi_ssid = "xxxx";
-const char *wifi_pass = "yyyy";
+// Supplied by the git-ignored secrets.h. The fallbacks keep the sketch
+// compiling out of the box and make it obvious that configuration is missing.
+#ifndef WIFI_SSID
+  #define WIFI_SSID "xxxx"
+#endif
+#ifndef WIFI_PASS
+  #define WIFI_PASS "yyyy"
+#endif
 
 /*----------------------------- RTC and NTP -------------------------------*/
 
@@ -50,8 +64,9 @@ I2C_BM8563 rtc(I2C_BM8563_DEFAULT_ADDRESS, Wire1);
 const char* ntpServer         = "time.cloudflare.com";
 const char* ntpLastUpdate     = "/ntp_last_update.txt";
 
-// NTP Clock Offset / Timezone
-#define CLOCK_GMT_OFFSET 1
+// POSIX timezone string. UK: GMT with British Summer Time.
+// Change this for your region, e.g. "CET-1CEST,M3.5.0,M10.5.0/3".
+const char* clockTz = "GMT0BST,M3.5.0/1,M10.5.0";
 
 /*-------------------------- HUB75E DMA Setup -----------------------------*/
 #define PANEL_RES_X 64      // Number of pixels wide of each INDIVIDUAL panel module. 
@@ -77,15 +92,13 @@ HUB75_I2S_CFG::i2s_pins _pins_x2 = {WF2_X2_R1_PIN, WF2_X2_G1_PIN, WF2_X2_B1_PIN,
 // ESP32 WebServer.
 WebServer           webServer;
 WiFiMulti           wifiMulti;
-ESP32Time           esp32rtc;  // offset in seconds GMT+1
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 
 // INSTANTIATE A Button OBJECT FROM THE Bounce2 NAMESPACE
 Bounce2::Button button = Bounce2::Button();
 
-// ROS Task management
+// FreeRTOS task management
 TaskHandle_t Task1;
-TaskHandle_t Task2;
 
 #include "led_pwm_handler.h"
 
@@ -102,7 +115,8 @@ enum DisplayMode {
 DisplayMode currentDisplayMode = MODE_CLOCK_WITH_ANIMATION;
 unsigned long buttonPressStartTime = 0;
 bool buttonPressHandled = false;
-volatile bool buttonPressed = false;
+
+const unsigned long LONG_PRESS_MS = 2000;
 
 // Bouncing squares animation variables
 struct BouncingSquare {
@@ -115,11 +129,10 @@ struct BouncingSquare {
 const int NUM_SQUARES = 3;
 BouncingSquare squares[NUM_SQUARES];
 
-IRAM_ATTR void toggleButtonPressed() {
-  // This function will be called when the interrupt occurs on pin PUSH_BUTTON_PIN
-  buttonPressed = true;
-  ESP_LOGI("toggleButtonPressed", "Interrupt Triggered.");
-}
+// Cached clock overlay for bouncing-squares mode
+char overlayBuffer[8] = "--:--";
+unsigned long lastOverlayUpdate = 0;
+bool overlayValid = false;
 
 // Initialize bouncing squares
 void initBouncingSquares() {
@@ -179,17 +192,71 @@ void print_wakeup_reason(){
   }
 }
 
+// Prepare the hardware and enter deep sleep.
+void enterDeepSleep() {
+  Serial.println("Preparing for deep sleep...");
 
-// Function that gets current epoch time
-unsigned long getEpochTime() {
-  time_t now;
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    //Serial.println("Failed to obtain time");
-    return(0);
+  // Blank the panel and turn the brightness off.
+  dma_display->clearScreen();
+  dma_display->setBrightness8(0);
+
+  // Keep the button pin pulled up while the RTC domain is powered.
+  rtc_gpio_pullup_en((gpio_num_t)PUSH_BUTTON_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)PUSH_BUTTON_PIN);
+
+  // Release network and filesystem resources.
+  MDNS.end();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  LittleFS.end();
+
+  delay(100);
+  esp_deep_sleep_start();
+}
+
+
+// Returns true if the system clock has a plausible date (after 2020).
+bool isSystemTimeValid() {
+  return time(nullptr) > 1600000000;
+}
+
+// Convert a broken-down *UTC* time to a Unix epoch.
+//
+// The external RTC stores UTC (see the NTP write path). Using mktime() here
+// would interpret the fields as local time and apply the timezone offset
+// twice, so the conversion is done explicitly instead.
+time_t utcTmToEpoch(const struct tm* tmUtc) {
+  const int year  = tmUtc->tm_year + 1900;
+  const int month = tmUtc->tm_mon + 1; // 1-12
+  const int y     = year - (month <= 2 ? 1 : 0);
+  const int era   = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153u * (unsigned)(month + (month > 2 ? -3 : 9)) + 2u) / 5u
+                       + (unsigned)tmUtc->tm_mday - 1u;
+  const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+  const long long days = (long long)era * 146097LL + (long long)doe - 719468LL;
+
+  return (time_t)(days * 86400LL +
+                  (long long)tmUtc->tm_hour * 3600LL +
+                  (long long)tmUtc->tm_min * 60LL +
+                  (long long)tmUtc->tm_sec);
+}
+
+// Seed the system clock from a UTC epoch value.
+bool setSystemTimeFromEpoch(time_t epoch) {
+  if (epoch <= 0) {
+    return false;
   }
-  time(&now);
-  return now;
+  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+  return settimeofday(&tv, nullptr) == 0;
+}
+
+// Function that gets current epoch time without blocking.
+unsigned long getEpochTime() {
+  if (!isSystemTimeValid()) {
+    return 0;
+  }
+  return (unsigned long)time(nullptr);
 }
 
 // Check if RTC has valid date/time
@@ -214,44 +281,97 @@ bool isRTCTimeValid(const I2C_BM8563_DateTypeDef &date, const I2C_BM8563_TimeTyp
   if (time.minutes > 59 || time.seconds > 59) {
     return false;
   }
+  // Weekday may be 0-6 or 1-7 depending on the RTC library.
+  if (date.weekDay > 7) {
+    return false;
+  }
+
+  // Validate the day of month against the month and leap year.
+  static const uint8_t daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  uint8_t maxDay = daysInMonth[date.month - 1];
+  bool leapYear = ((date.year % 4 == 0 && date.year % 100 != 0) || (date.year % 400 == 0));
+  if (date.month == 2 && leapYear) {
+    maxDay = 29;
+  }
+  if (date.date > maxDay) {
+    return false;
+  }
+
   return true;
 }
 
-// Get time from external RTC as fallback
+// Get time from external RTC as fallback.
+// The BM8563 holds UTC; the value is converted to local time for display so
+// DST changes never corrupt the stored time.
 bool getRTCTime(struct tm* timeinfo) {
   I2C_BM8563_DateTypeDef rtcDate;
   I2C_BM8563_TimeTypeDef rtcTime;
-  
+
   // Get date and time from RTC (these are void functions)
   rtc.getDate(&rtcDate);
   rtc.getTime(&rtcTime);
-  
+
   if (!isRTCTimeValid(rtcDate, rtcTime)) {
     return false;
   }
-  
-  timeinfo->tm_year = rtcDate.year - 1900;
-  timeinfo->tm_mon = rtcDate.month - 1;
-  timeinfo->tm_mday = rtcDate.date;
-  timeinfo->tm_hour = rtcTime.hours;
-  timeinfo->tm_min = rtcTime.minutes;
-  timeinfo->tm_sec = rtcTime.seconds;
-  timeinfo->tm_wday = rtcDate.weekDay;
-  timeinfo->tm_isdst = -1;
-  
+
+  struct tm utcTm = {};
+  utcTm.tm_year  = rtcDate.year - 1900;
+  utcTm.tm_mon   = rtcDate.month - 1;
+  utcTm.tm_mday  = rtcDate.date;
+  utcTm.tm_hour  = rtcTime.hours;
+  utcTm.tm_min   = rtcTime.minutes;
+  utcTm.tm_sec   = rtcTime.seconds;
+  utcTm.tm_wday  = rtcDate.weekDay % 7;
+  utcTm.tm_isdst = 0; // RTC values are UTC
+
+  const time_t epoch = utcTmToEpoch(&utcTm);
+  localtime_r(&epoch, timeinfo);
   return true;
 }
 
-// Enhanced time getter with RTC fallback
+// Cache of the last successfully read local time. If every time source fails
+// temporarily the display keeps counting from this value instead of showing an
+// error.
+static struct tm      lastValidLocalTime = {};
+static unsigned long  lastValidLocalMillis = 0;
+static bool           haveLastValidLocalTime = false;
+
+static void cacheLocalTime(const struct tm* timeinfo) {
+  lastValidLocalTime = *timeinfo;
+  lastValidLocalMillis = millis();
+  haveLastValidLocalTime = true;
+}
+
+// Enhanced time getter with RTC and cached-time fallbacks.
 bool getTimeWithFallback(struct tm* timeinfo) {
-  // Try ESP32 internal RTC first
-  if (getLocalTime(timeinfo)) {
+  // Non-blocking read of the system clock. getLocalTime() with a timeout
+  // would stall the display for up to 5 seconds when the clock is not set.
+  if (getLocalTime(timeinfo, 0)) {
+    cacheLocalTime(timeinfo);
     return true;
   }
-  
+
   // Fallback to external RTC
-  Serial.println("ESP32 RTC failed, trying external RTC...");
-  return getRTCTime(timeinfo);
+  if (getRTCTime(timeinfo)) {
+    cacheLocalTime(timeinfo);
+    return true;
+  }
+
+  // Last resort: advance the cached time by the elapsed milliseconds so the
+  // clock keeps running until a time source recovers.
+  if (haveLastValidLocalTime) {
+    struct tm cached = lastValidLocalTime;
+    const unsigned long elapsedSec = (millis() - lastValidLocalMillis) / 1000UL;
+    const time_t cachedEpoch = mktime(&cached);
+    if (cachedEpoch > 0) {
+      const time_t advanced = cachedEpoch + (time_t)elapsedSec;
+      localtime_r(&advanced, timeinfo);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Function declarations
@@ -287,9 +407,22 @@ void setup() {
     //mxconfig.min_refresh_rate = 30;
 
 
-    // Display Setup
-    dma_display = new MatrixPanel_I2S_DMA(mxconfig);
-    dma_display->begin();
+    // Display Setup. Check both the allocation and the panel initialisation
+    // so a hardware or memory failure is reported instead of silently drawing
+    // into an unusable panel.
+    dma_display = new (std::nothrow) MatrixPanel_I2S_DMA(mxconfig);
+    if (dma_display == nullptr) {
+      Serial.println("Failed to allocate the HUB75 display object - halting");
+      while (true) {
+        delay(1000);
+      }
+    }
+    if (!dma_display->begin()) {
+      Serial.println("HUB75 panel initialisation failed - halting");
+      while (true) {
+        delay(1000);
+      }
+    }
     dma_display->setBrightness8(128); //0-255
     dma_display->clearScreen();
 
@@ -305,14 +438,24 @@ void setup() {
 
   /*-------------------- START THE NETWORKING --------------------*/
   WiFi.mode(WIFI_STA);
-  wifiMulti.addAP(wifi_ssid, wifi_pass); // configure in the *-config.h file
+  // Keep the radio awake so the web server stays responsive.
+  WiFi.setSleep(false);
+  // Credentials come from the git-ignored secrets.h.
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASS);
 
-  // wait for WiFi connection
+  // Wait for WiFi connection, but do not block forever. The clock can run
+  // from the RTC even when the network is unavailable.
   Serial.print("Waiting for WiFi to connect...");
-  while (wifiMulti.run() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (wifiMulti.run() != WL_CONNECTED && (millis() - wifiStart) < 15000) {
     Serial.print(".");
+    delay(250);
   }
-  Serial.println(" connected");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" connected");
+  } else {
+    Serial.println(" failed - continuing offline");
+  }
     
 
   /*-------------------- --------------- --------------------*/
@@ -333,8 +476,9 @@ void setup() {
   }
   else
   {
+    dma_display->clearScreen();
+    dma_display->setCursor(0, 0);
     dma_display->print("Starting.");
-
   }
 
 
@@ -345,10 +489,19 @@ void setup() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PUSH_BUTTON_PIN, 0); //1 = High, 0 = Low  
 
   /*-------------------- --------------- --------------------*/
-  // BUTTON SETUP 
-  button.attach( PUSH_BUTTON_PIN, INPUT ); // USE EXTERNAL PULL-UP
+  // BUTTON SETUP
+  // INPUT_PULLUP is safe even when the board has an external pull-up.
+  button.attach( PUSH_BUTTON_PIN, INPUT_PULLUP );
   button.interval(5);   // DEBOUNCE INTERVAL IN MILLISECONDS
   button.setPressedState(LOW); // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
+
+  // If the button is already held at boot (for example, when waking from
+  // deep sleep), ignore it until it has been released.
+  button.update();
+  if (button.isPressed()) {
+    buttonPressHandled = true;
+    buttonPressStartTime = millis();
+  }
 
 
   /*-------------------- LEDC Controller --------------------*/
@@ -379,7 +532,7 @@ void setup() {
     xTaskCreatePinnedToCore(
       ledFadeTask,            /* Task function. */
       "ledFadeTask",                 /* name of task. */
-      1000,                    /* Stack size of task */
+      2048,                    /* Stack size of task */
       NULL,                     /* parameter of the task */
       1,                        /* priority of the task */
       &Task1,                   /* Task handle to keep track of created task */
@@ -396,7 +549,18 @@ void setup() {
   /*-------------------- --------------- --------------------*/
   // Init I2C for RTC
   Wire1.begin(BM8563_I2C_SDA, BM8563_I2C_SCL);
-  rtc.begin();
+  rtc.begin(); // returns void, so probe the bus for the chip instead
+
+  // Confirm the BM8563 actually answers on the I2C bus.
+  Wire1.beginTransmission(I2C_BM8563_DEFAULT_ADDRESS);
+  const bool rtcPresent = (Wire1.endTransmission() == 0);
+  if (!rtcPresent) {
+    Serial.println("BM8563 RTC not detected on the I2C bus");
+  }
+
+  // Configure the timezone and start SNTP. This sets the TZ environment
+  // variable so that getLocalTime() and mktime() use local time.
+  configTzTime(clockTz, ntpServer);
 
   // Get RTC date and time
   I2C_BM8563_DateTypeDef rtcDate;
@@ -406,8 +570,8 @@ void setup() {
   rtc.getDate(&rtcDate);
   rtc.getTime(&rtcTime);
   
-  // Validate RTC data
-  bool rtcDataValid = isRTCTimeValid(rtcDate, rtcTime);
+  // Validate RTC data (and that the chip is actually present).
+  bool rtcDataValid = rtcPresent && isRTCTimeValid(rtcDate, rtcTime);
   
   if (rtcDataValid) {
     Serial.printf("RTC Date: %04d-%02d-%02d %02d:%02d:%02d\n", 
@@ -418,14 +582,18 @@ void setup() {
   }
   
   time_t ntp_last_update_ts = 0;
-  File file = fs.open(ntpLastUpdate, FILE_READ, true);
-  if(!file) {
-      Serial.println("NTP last update file not found - will perform NTP sync");
-  } else  {
-      file.read( (uint8_t*) &ntp_last_update_ts, sizeof(ntp_last_update_ts));          
-      Serial.print("NTP last update epoch: ");
-      Serial.println(ntp_last_update_ts);
-      file.close();      
+  // Explicitly pass create = false: opening the timestamp file for reading
+  // must not create it, otherwise the missing-file branch is never taken.
+  File file = LittleFS.open(ntpLastUpdate, FILE_READ, false);
+  if (!file) {
+    Serial.println("NTP last update file not found - will perform NTP sync");
+  } else {
+    if (file.read((uint8_t*)&ntp_last_update_ts, sizeof(ntp_last_update_ts)) != sizeof(ntp_last_update_ts)) {
+      ntp_last_update_ts = 0;
+    }
+    Serial.print("NTP last update epoch: ");
+    Serial.println((long)ntp_last_update_ts);
+    file.close();
   }
 
   // Current RTC time (include time components for better comparison)
@@ -440,15 +608,18 @@ void setup() {
     curr_rtc_tm.tm_hour = rtcTime.hours;        // hours since midnight (0-23)
     curr_rtc_tm.tm_min = rtcTime.minutes;       // minutes after the hour (0-59)
     curr_rtc_tm.tm_sec = rtcTime.seconds;       // seconds after the minute (0-59)
-    curr_rtc_tm.tm_isdst = -1;                  // daylight saving time flag
-    
-    curr_rtc_ts = mktime(&curr_rtc_tm);
-    
+    curr_rtc_tm.tm_isdst = 0;                   // the RTC stores UTC
+
+    // Convert as UTC so the freshness check does not depend on the local
+    // timezone. Use 64-bit math for the difference.
+    curr_rtc_ts = utcTmToEpoch(&curr_rtc_tm);
+
     // Check if we need NTP update (more than 7 days old, or no previous NTP sync)
     if (ntp_last_update_ts > 0) {
-      long timeDiff = abs((long int)(curr_rtc_ts - ntp_last_update_ts));
-      needNTPUpdate = (timeDiff > (60*60*24*7)); // 7 days instead of 30
-      Serial.printf("Time difference: %ld seconds (%ld days)\n", timeDiff, timeDiff/(60*60*24));
+      long long timeDiff = llabs((long long)curr_rtc_ts - (long long)ntp_last_update_ts);
+      needNTPUpdate = (timeDiff > (60LL * 60LL * 24LL * 7LL)); // 7 days
+      Serial.printf("Time difference: %lld seconds (%lld days)\n",
+                    timeDiff, timeDiff / (60LL * 60LL * 24LL));
     }
   }
 
@@ -457,43 +628,53 @@ void setup() {
       Serial.println("Performing NTP time synchronization...");
       ESP_LOGI("ntp_update", "Updating time from NTP server");    
   
-      // Set ntp time to local
-      configTime(CLOCK_GMT_OFFSET * 3600, 0, ntpServer);
-
-      // Wait for NTP sync with timeout
+      // Wait for SNTP to complete, with a timeout. Do not use getLocalTime()
+      // here because it can block and because the system clock may already be
+      // valid from a previous sync.
       int ntpRetries = 0;
-      struct tm timeInfo;
-      while (!getLocalTime(&timeInfo) && ntpRetries < 10) {
-        delay(1000);
+      while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && ntpRetries < 150) {
+        delay(100);
         ntpRetries++;
-        Serial.print(".");
+        if ((ntpRetries % 10) == 0) {
+          Serial.print(".");
+        }
       }
-      
-      if (getLocalTime(&timeInfo)) {
+
+      struct tm timeInfo;
+      if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED && getLocalTime(&timeInfo, 0)) {
         Serial.println("\nNTP sync successful");
-        
+
+        // Keep the RTC in UTC. Storing local time would make the clock wrong
+        // for an hour after every DST transition until the next NTP sync.
+        const time_t nowEpoch = time(nullptr);
+        struct tm utcTime = {};
+        gmtime_r(&nowEpoch, &utcTime);
+
         // Set RTC time - setTime returns void, so we can't check its return value
         I2C_BM8563_TimeTypeDef timeStruct;
-        timeStruct.hours   = timeInfo.tm_hour;
-        timeStruct.minutes = timeInfo.tm_min;
-        timeStruct.seconds = timeInfo.tm_sec;
-        
+        timeStruct.hours   = utcTime.tm_hour;
+        timeStruct.minutes = utcTime.tm_min;
+        timeStruct.seconds = utcTime.tm_sec;
+
         rtc.setTime(&timeStruct);
         Serial.println("RTC time set successfully");
 
         // Set RTC Date - setDate returns void, so we can't check its return value
         I2C_BM8563_DateTypeDef dateStruct;
-        dateStruct.weekDay = timeInfo.tm_wday;
-        dateStruct.month   = timeInfo.tm_mon + 1;
-        dateStruct.date    = timeInfo.tm_mday;
-        dateStruct.year    = timeInfo.tm_year + 1900;
-        
+        dateStruct.weekDay = utcTime.tm_wday;
+        dateStruct.month   = utcTime.tm_mon + 1;
+        dateStruct.date    = utcTime.tm_mday;
+        dateStruct.year    = utcTime.tm_year + 1900;
+
         rtc.setDate(&dateStruct);
-        Serial.printf("RTC updated to: %04d-%02d-%02d %02d:%02d:%02d\n",
+        Serial.printf("RTC updated (UTC) to: %04d-%02d-%02d %02d:%02d:%02d\n",
                       dateStruct.year, dateStruct.month, dateStruct.date,
                       timeStruct.hours, timeStruct.minutes, timeStruct.seconds);
-        
-        // Update local variables with new time
+        Serial.printf("Local time is: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+                      timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+
+        // Keep the cached RTC values in sync with what is now stored (UTC).
         rtcDate = dateStruct;
         rtcTime = timeStruct;
         rtcDataValid = true;
@@ -504,25 +685,46 @@ void setup() {
       // Save NTP update timestamp
       ntp_last_update_ts = getEpochTime();
       if (ntp_last_update_ts > 0) {
-        File file = fs.open(ntpLastUpdate, FILE_WRITE);
-        if(!file) {
-            Serial.println("Failed to open NTP timestamp file for writing");
-        } else  {
-            file.write( (uint8_t*) &ntp_last_update_ts, sizeof(ntp_last_update_ts));          
-            file.close();      
-            Serial.print("Saved NTP update timestamp: "); 
-            Serial.println(ntp_last_update_ts, DEC);            
+        File tsFile = LittleFS.open(ntpLastUpdate, FILE_WRITE);
+        if (!tsFile) {
+          Serial.println("Failed to open NTP timestamp file for writing");
+        } else {
+          tsFile.write((uint8_t*)&ntp_last_update_ts, sizeof(ntp_last_update_ts));
+          tsFile.close();
+          Serial.print("Saved NTP update timestamp: ");
+          Serial.println((long)ntp_last_update_ts);
         }
       }
 
   }
   
-  // Update ESP32 internal RTC if we have valid external RTC data
-  if (rtcDataValid) {
-    esp32rtc.setTime(rtcTime.seconds, rtcTime.minutes, rtcTime.hours, 
-                     rtcDate.date, rtcDate.month, rtcDate.year);
-    Serial.println("ESP32 internal RTC updated from external RTC:");    
-    Serial.println(esp32rtc.getTime("%A, %B %d %Y %H:%M:%S"));
+  // If the system clock is still not valid (NTP skipped or failed), seed it
+  // from the external RTC so that getLocalTime() works without blocking.
+  if (rtcDataValid && !isSystemTimeValid()) {
+    struct tm rtcTm = {};
+    rtcTm.tm_year = rtcDate.year - 1900;
+    rtcTm.tm_mon  = rtcDate.month - 1;
+    rtcTm.tm_mday = rtcDate.date;
+    rtcTm.tm_hour = rtcTime.hours;
+    rtcTm.tm_min  = rtcTime.minutes;
+    rtcTm.tm_sec  = rtcTime.seconds;
+    rtcTm.tm_isdst = 0; // the RTC stores UTC
+    if (setSystemTimeFromEpoch(utcTmToEpoch(&rtcTm))) {
+      Serial.println("System clock seeded from external RTC (UTC)");
+    } else {
+      Serial.println("Failed to seed system clock from external RTC");
+    }
+  }
+
+  // Report the local time currently in use (the system clock is the single
+  // source of truth; no separate ESP32Time instance is maintained).
+  if (isSystemTimeValid()) {
+    const time_t nowEpoch = time(nullptr);
+    struct tm localTm = {};
+    localtime_r(&nowEpoch, &localTm);
+    char timeStr[40];
+    strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &localTm);
+    Serial.printf("Local time in use: %s\n", timeStr);
   } else {
     Serial.println("Warning: No valid time source available!");
   }
@@ -533,22 +735,34 @@ void setup() {
       webServer.send(200, "text/plain", "Hi! I am here.");
     });
 
-    //ElegantOTA.begin(&webServer);    // Start ElegantOTA
+    //ElegantOTA.begin(&webServer);    // Start ElegantOTA (see README)
     webServer.begin();
-    Serial.println("OTA HTTP server started");
+    Serial.println("Web server started");
+
+    // Advertise the device as ledclock.local on the local network.
+    if (MDNS.begin("ledclock")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("mDNS started: http://ledclock.local/");
+    } else {
+      Serial.println("mDNS failed to start");
+    }
 
     /*-------------------- --------------- --------------------*/
+    const bool wifiConnected = (WiFi.status() == WL_CONNECTED);
     Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());  
+    Serial.println(wifiConnected ? WiFi.localIP().toString() : String("offline"));
 
-    delay(1000);
-    
+    // Show the address (or an offline notice) and only clear it afterwards.
     dma_display->clearScreen();
-    dma_display->setCursor(0,0);
-
-    dma_display->print(WiFi.localIP());
-    dma_display->clearScreen();
+    dma_display->setCursor(0, 0);
+    dma_display->setTextColor(dma_display->color565(255, 255, 255));
+    if (wifiConnected) {
+      dma_display->print(WiFi.localIP());
+    } else {
+      dma_display->print("Offline");
+    }
     delay(3000);
+    dma_display->clearScreen();
 
     // Initialize bouncing squares for animation mode
     initBouncingSquares();
@@ -557,43 +771,63 @@ void setup() {
 
 unsigned long last_update = 0;
 char buffer[64];
-void loop() 
+void loop()
 {
     // YOU MUST CALL THIS EVERY LOOP
     button.update();
 
-    // Handle button press logic
-    if (button.pressed() && !buttonPressHandled) {
+    // Handle button press logic.
+    //
+    // The flag is cleared on every new press and re-armed on every release so
+    // that the button works repeatedly. A button that is already held when the
+    // device boots (e.g. waking from deep sleep) is marked as handled in
+    // setup(), so it cannot immediately trigger another long press/sleep until
+    // it has been released.
+    if (button.pressed()) {
         buttonPressStartTime = millis();
         buttonPressHandled = false;
         Serial.println("Button pressed");
     }
-    
-    if (button.isPressed() && !buttonPressHandled) {
-        // Check if button has been held for more than 2 seconds
-        if (millis() - buttonPressStartTime > 2000) {
-            Serial.println("Button held for >2s - going to sleep");
-            esp_deep_sleep_start();
-            buttonPressHandled = true;
-        }
+
+    // Long press: enter deep sleep.
+    if (button.isPressed() && !buttonPressHandled &&
+        (millis() - buttonPressStartTime >= LONG_PRESS_MS)) {
+        buttonPressHandled = true;
+        Serial.println("Button held for >2s - going to sleep");
+        enterDeepSleep();
     }
-    
-    if (button.released() && !buttonPressHandled) {
-        // Button was released before 2 seconds - cycle display mode
-        if (millis() - buttonPressStartTime < 2000) {
+
+    if (button.released()) {
+        if (!buttonPressHandled) {
+            // Short press: cycle display mode
+            buttonPressHandled = true;
             currentDisplayMode = (DisplayMode)((currentDisplayMode + 1) % MODE_COUNT);
             Serial.print("Switched to display mode: ");
             Serial.println(currentDisplayMode);
-            
+
             // Clear screen when switching modes
             dma_display->clearScreen();
-            
+            last_update = 0;
+            lastOverlayUpdate = 0;
+
             // If switching to bouncing squares, reinitialize them
             if (currentDisplayMode == MODE_BOUNCING_SQUARES) {
                 initBouncingSquares();
             }
         }
-        buttonPressHandled = true;
+
+        // Re-arm the state machine for the next press.
+        buttonPressHandled = false;
+    }
+
+    // Periodically try to reconnect if the network drops.
+    static unsigned long lastWifiCheck = 0;
+    if (millis() - lastWifiCheck > 10000) {
+        lastWifiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected - reconnecting...");
+            wifiMulti.run();
+        }
     }
 
     webServer.handleClient();
@@ -626,8 +860,9 @@ void updateClockWithAnimation() {
             snprintf(buffer, 64, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 
             Serial.println("Performing screen time update...");
-            dma_display->fillRect(0, 9, PANEL_RES_X, 9, 0x00); // wipe the section of the screen just used for the time
+            dma_display->fillRect(0, 9, PANEL_RES_X * PANEL_CHAIN, 9, 0x00); // wipe the section of the screen just used for the time
             dma_display->setCursor(8, 10);
+            dma_display->setTextColor(dma_display->color565(255, 255, 255));
             dma_display->print(buffer);
         } else {
             Serial.println("Failed to get time from all sources.");
@@ -680,30 +915,36 @@ void updateClockWithAnimation() {
 
 // Clock only mode (no animation background)
 void updateClockOnly() {
+    static bool lastValid = false;
+
     if ((millis() - last_update) > 1000) {
         struct tm timeinfo;
-        if (getTimeWithFallback(&timeinfo)) {
-            dma_display->clearScreen();
-            
+        bool valid = getTimeWithFallback(&timeinfo);
+
+        if (valid) {
+            // Clear only when recovering from an error, to avoid flicker.
+            if (!lastValid) {
+                dma_display->clearScreen();
+            }
+
             // Display time
-            memset(buffer, 0, 64);
-            snprintf(buffer, 64, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             dma_display->setCursor(8, 4);
             dma_display->setTextColor(dma_display->color565(255, 255, 255));
             dma_display->print(buffer);
-            
+
             // Display date
-            memset(buffer, 0, 64);
-            snprintf(buffer, 64, "%02d/%02d/%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+            snprintf(buffer, sizeof(buffer), "%02d/%02d/%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
             dma_display->setCursor(2, 16);
             dma_display->setTextColor(dma_display->color565(200, 200, 200));
             dma_display->print(buffer);
-            
+
             // Display day of week
             const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-            dma_display->setCursor(2, 26);
+            int wday = timeinfo.tm_wday % 7;
+            dma_display->setCursor(2, 24);
             dma_display->setTextColor(dma_display->color565(150, 150, 255));
-            dma_display->print(days[timeinfo.tm_wday]);
+            dma_display->print(days[wday]);
 
             Serial.println("Clock-only mode update");
         } else {
@@ -713,33 +954,31 @@ void updateClockOnly() {
             dma_display->setTextColor(dma_display->color565(255, 0, 0));
             dma_display->print("NO TIME");
         }
+
+        lastValid = valid;
         last_update = millis();
     }
 }
 
 // Update clock overlay for bouncing squares mode
 void updateClockOverlay() {
-    if ((millis() - last_update) > 1000) {
+    // Refresh the cached time string once per second.
+    if ((millis() - lastOverlayUpdate) > 1000) {
         struct tm timeinfo;
         if (getTimeWithFallback(&timeinfo)) {
-            memset(buffer, 0, 64);
-            snprintf(buffer, 64, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-            
-            // Draw time with black background for readability
-            dma_display->fillRect(18, 12, 28, 8, 0x0000);
-            dma_display->setCursor(20, 14);
-            dma_display->setTextColor(dma_display->color565(255, 255, 255));
-            dma_display->print(buffer);
-
-            Serial.println("Bouncing squares with clock overlay update");
+            snprintf(overlayBuffer, sizeof(overlayBuffer), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+            overlayValid = true;
         } else {
-            Serial.println("Failed to get time from all sources.");
-            // Show error in overlay
-            dma_display->fillRect(18, 12, 28, 8, 0x0000);
-            dma_display->setCursor(20, 14);
-            dma_display->setTextColor(dma_display->color565(255, 0, 0));
-            dma_display->print("ERR");
+            snprintf(overlayBuffer, sizeof(overlayBuffer), "ERR");
+            overlayValid = false;
         }
-        last_update = millis();
+        lastOverlayUpdate = millis();
     }
-} 
+
+    // Redraw every frame so the bouncing-squares clear does not erase it.
+    dma_display->fillRect(17, 12, 30, 8, 0x0000);
+    dma_display->setCursor(17, 12);
+    dma_display->setTextColor(overlayValid ? dma_display->color565(255, 255, 255)
+                                           : dma_display->color565(255, 0, 0));
+    dma_display->print(overlayBuffer);
+}

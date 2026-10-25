@@ -8,9 +8,31 @@ Custom firmware based on my [HUB75 DMA library](https://github.com/mrfaptastic/E
 - **Multiple Display Modes**: Three different visual modes accessible via button control
 - **Robust Real-Time Clock**: Enhanced RTC handling with NTP synchronization, data validation, and automatic fallback
 - **Deep Sleep Support**: Power-saving sleep mode with button wake-up
-- **WiFi Connectivity**: OTA firmware updates via web interface
+- **WiFi Connectivity**: Built-in web server reachable at `http://ledclock.local/` via mDNS (OTA is optional and disabled by default, see below)
 - **Debounced Button Control**: Reliable button handling with short/long press detection
 - **Animated Graphics**: Colorful animations and bouncing effects
+
+## Configuration
+
+WiFi credentials are not stored in source control. Copy the template and fill in
+your own values:
+
+```
+copy src/secrets.h.example src/secrets.h
+```
+
+`src/secrets.h` is git-ignored. If it is missing the sketch still compiles using
+the `xxxx` / `yyyy` placeholders, but it will stay offline.
+
+The timezone is set with a POSIX TZ string in the sketch
+(`GMT0BST,M3.5.0/1,M10.5.0`); change `clockTz` for your region.
+
+## OTA firmware updates
+
+OTA is **not** enabled in the default build. The sketch contains a commented
+`#include <ElegantOTA.h>` and `ElegantOTA.begin(&webServer)` call. To enable OTA:
+uncomment both lines and add `ayushsharma82/ElegantOTA` to `lib_deps` in
+`platformio.ini`, then reach the upload page at `http://<ipaddress>/update`.
 
 ## Huidu WF1
 These can be bought for about USD $6 and are quite good as they come with a battery and a Real Time Clock (BM8563), and a push button connected to GPIO 11 for your use.
@@ -79,12 +101,13 @@ The device will wake up from deep sleep when the button is pressed again.
 - Deep sleep preserves battery life when the display is not needed
 - All three display modes maintain accurate timekeeping
 - Bouncing squares animation uses physics-based collision detection
-- **Enhanced RTC Management**:
-  - Automatic data validation for RTC readings
+- **Enhanced Time Management**:
+  - The BM8563 RTC is kept in UTC and converted to local time for display, so DST changes are handled by the POSIX timezone rules
   - NTP synchronization every 7 days (configurable)
-  - Fallback from ESP32 internal RTC to external BM8563 RTC
-  - Error handling and recovery for corrupted time data
+  - Fallbacks: system clock -> external BM8563 RTC -> last known good time (so the clock keeps running through short outages)
+  - Automatic data validation for RTC readings, including per-month and leap-year day checks
   - Detailed logging of time synchronization events
+- **Networking**: non-blocking WiFi startup with offline fallback, periodic reconnect, `WiFi.setSleep(false)`, and mDNS at `ledclock.local`
 
 Designed for a 64x32px LED matrix panel.
 

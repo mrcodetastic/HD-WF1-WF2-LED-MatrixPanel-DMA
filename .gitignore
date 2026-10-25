@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local WiFi credentials - copy src/secrets.h.example to src/secrets.h
+src/secrets.h

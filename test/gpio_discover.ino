@@ -14,10 +14,11 @@ void setup() {
   }
   
   pinMode(11, INPUT_PULLUP); // Set pin 11 as input with internal pull-up resistor
-  attachInterrupt(digitalPinToInterrupt(11), runme, RISING); // Set up the interrupt on rising edge of pin 11
-  
+  // The button is active-low (pulled up), so trigger on the falling edge.
+  attachInterrupt(digitalPinToInterrupt(11), runme, FALLING);
+
   // Start the serial communication
-  Serial.begin(112500);
+  Serial.begin(115200);
 }
 
 void loop() {
@@ -52,7 +53,7 @@ void loop() {
 
 }
 
-void runme() {
+void IRAM_ATTR runme() {
   // This function will be called when the interrupt occurs on pin 11
   interruptFlag = true;
   // Do something here
