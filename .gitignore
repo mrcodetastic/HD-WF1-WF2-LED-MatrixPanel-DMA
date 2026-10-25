@@ -6,3 +6,6 @@
 
 # Local WiFi credentials - copy src/secrets.h.example to src/secrets.h
 src/secrets.h
+
+#AI review
+plans/
