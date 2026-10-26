@@ -2,6 +2,8 @@
 // Example shop link: https://www.aliexpress.com/item/1005005038544582.html -> WF1
 // Example shop link: https://www.aliexpress.com/item/1005002271988988.html -> WF2
 
+//#define WF1
+
 #if defined(WF1)
   #include "hd-wf1-esp32s2-config.h"
 #elif defined(WF2)
@@ -129,6 +131,15 @@ struct BouncingSquare {
 const int NUM_SQUARES = 3;
 BouncingSquare squares[NUM_SQUARES];
 
+// Frame rate limit for the bouncing-squares mode.
+//
+// loop() runs as fast as the display refresh allows (hundreds of frames per
+// second), and the squares move by a fixed amount per frame, so without a cap
+// the animation is far too fast. Rendering at a fixed ~25 fps makes the speed
+// predictable and independent of how quickly the rest of the loop runs.
+const unsigned long BOUNCING_FRAME_MS = 40;   // 1000 ms / 40 ms = 25 fps
+unsigned long lastBouncingFrameMs = 0;
+
 // Cached clock overlay for bouncing-squares mode
 char overlayBuffer[8] = "--:--";
 unsigned long lastOverlayUpdate = 0;
@@ -148,6 +159,13 @@ void initBouncingSquares() {
 
 // Update and draw bouncing squares
 void updateBouncingSquares() {
+  // Throttle the animation to ~25 fps; skip this frame if not due yet.
+  const unsigned long now = millis();
+  if (lastBouncingFrameMs != 0 && (now - lastBouncingFrameMs) < BOUNCING_FRAME_MS) {
+    return;
+  }
+  lastBouncingFrameMs = now;
+
   dma_display->clearScreen();
   
   for (int i = 0; i < NUM_SQUARES; i++) {
@@ -192,6 +210,35 @@ void print_wakeup_reason(){
   }
 }
 
+// Block until the push button has been physically released and the Bounce2
+// state machine has settled on the released state.
+//
+// This is required before entering deep sleep: the EXT0 wake is LEVEL
+// triggered on LOW, so if the chip is put to sleep while the button is still
+// held, the wake condition is already active and the chip wakes again
+// immediately (the observed "releasing the button wakes it up" behaviour).
+//
+// Returns true if the button was released within timeoutMs.
+bool waitForButtonRelease(unsigned long timeoutMs) {
+  const unsigned long holdStart = millis();
+  while (digitalRead(PUSH_BUTTON_PIN) == LOW) {
+    button.update();                 // keep Bounce2 in sync while waiting
+    if (millis() - holdStart >= timeoutMs) {
+      Serial.printf("[sleep] button still held after %lu ms\n", timeoutMs);
+      return false;
+    }
+    delay(5);
+  }
+
+  // Let the debouncer confirm the released state before continuing.
+  const unsigned long settleStart = millis();
+  while (millis() - settleStart < 50) {
+    button.update();
+    delay(5);
+  }
+  return true;
+}
+
 // Prepare the hardware and enter deep sleep.
 void enterDeepSleep() {
   Serial.println("Preparing for deep sleep...");
@@ -200,9 +247,35 @@ void enterDeepSleep() {
   dma_display->clearScreen();
   dma_display->setBrightness8(0);
 
+  // Do not sleep while the button that triggers sleep is still held: the EXT0
+  // wake level would already be active and the chip would wake immediately.
+  const unsigned long releaseTimeoutMs = 10000;
+  if (!waitForButtonRelease(releaseTimeoutMs)) {
+    Serial.println("[sleep] aborting sleep - the long press will not retrigger"
+                   " until the button is released");
+    dma_display->setBrightness8(128);
+    dma_display->clearScreen();
+    buttonPressHandled = true;   // consume this press; loop() re-arms on release
+    return;
+  }
+
   // Keep the button pin pulled up while the RTC domain is powered.
   rtc_gpio_pullup_en((gpio_num_t)PUSH_BUTTON_PIN);
   rtc_gpio_pulldown_dis((gpio_num_t)PUSH_BUTTON_PIN);
+
+  // Final safety check: the wake level must be inactive, otherwise the chip
+  // would wake up as soon as it sleeps.
+  const int pinLevel = digitalRead(PUSH_BUTTON_PIN);
+  Serial.printf("[sleep] millis=%lu bootCount=%d pin=%d button.isPressed()=%d\n",
+                (unsigned long)millis(), bootCount, pinLevel,
+                (int)button.isPressed());
+  if (pinLevel == LOW) {
+    Serial.println("[sleep] wake level still active - aborting sleep");
+    dma_display->setBrightness8(128);
+    dma_display->clearScreen();
+    buttonPressHandled = true;
+    return;
+  }
 
   // Release network and filesystem resources.
   MDNS.end();
@@ -211,6 +284,8 @@ void enterDeepSleep() {
   LittleFS.end();
 
   delay(100);
+  Serial.println("[sleep] entering deep sleep - press the button to wake");
+  Serial.flush();
   esp_deep_sleep_start();
 }
 
@@ -337,6 +412,11 @@ static struct tm      lastValidLocalTime = {};
 static unsigned long  lastValidLocalMillis = 0;
 static bool           haveLastValidLocalTime = false;
 
+// Minimum interval between external RTC polls when the system clock is not
+// valid. The RTC only has one-second resolution, so polling it on every display
+// refresh bought nothing, and its blocking I2C reads stalled the animation.
+static const unsigned long RTC_POLL_INTERVAL_MS = 60000;
+
 static void cacheLocalTime(const struct tm* timeinfo) {
   lastValidLocalTime = *timeinfo;
   lastValidLocalMillis = millis();
@@ -344,18 +424,42 @@ static void cacheLocalTime(const struct tm* timeinfo) {
 }
 
 // Enhanced time getter with RTC and cached-time fallbacks.
+//
+// This runs from the display refresh, so it must not block. Reading the
+// external RTC over I2C is the only slow operation here, so it is polled at a
+// limited rate and the cached time is advanced locally in between.
 bool getTimeWithFallback(struct tm* timeinfo) {
-  // Non-blocking read of the system clock. getLocalTime() with a timeout
-  // would stall the display for up to 5 seconds when the clock is not set.
-  if (getLocalTime(timeinfo, 0)) {
+  // Read the system clock directly instead of using getLocalTime().
+  //
+  // getLocalTime() is a polling loop that calls delay(10) while the clock is
+  // not valid yet. Even with a zero timeout it therefore blocked ~10 ms every
+  // second until NTP (or the boot-time RTC seed) had set the clock, which is
+  // what made the animation hitch once per second at startup.
+  if (isSystemTimeValid()) {
+    const time_t now = time(nullptr);
+    localtime_r(&now, timeinfo);
     cacheLocalTime(timeinfo);
     return true;
   }
 
-  // Fallback to external RTC
-  if (getRTCTime(timeinfo)) {
-    cacheLocalTime(timeinfo);
-    return true;
+  // Fallback to the external RTC, polled at most once per interval.
+  static bool rtcPolled = false;
+  static unsigned long lastRtcPollMs = 0;
+  if (!rtcPolled || (millis() - lastRtcPollMs) >= RTC_POLL_INTERVAL_MS) {
+    rtcPolled = true;
+    lastRtcPollMs = millis();
+
+    const unsigned long pollStartUs = micros();
+    const bool rtcOk = getRTCTime(timeinfo);
+    const unsigned long pollUs = micros() - pollStartUs;
+    if (pollUs > 5000) {
+      Serial.printf("[time] external RTC poll blocked for %lu us\n", pollUs);
+    }
+
+    if (rtcOk) {
+      cacheLocalTime(timeinfo);
+      return true;
+    }
   }
 
   // Last resort: advance the cached time by the elapsed milliseconds so the
@@ -485,8 +589,12 @@ void setup() {
   /*
     We set our ESP32 to wake up for an external trigger.
     There are two types for ESP32, ext0 and ext1 .
+
+    NOTE: EXT0 wake is LEVEL triggered, not edge triggered. Arming it for LOW
+    means the chip wakes as soon as the pin is LOW during deep sleep, so
+    enterDeepSleep() waits for the button to be released before sleeping.
   */
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PUSH_BUTTON_PIN, 0); //1 = High, 0 = Low  
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PUSH_BUTTON_PIN, 0); //1 = High, 0 = Low
 
   /*-------------------- --------------- --------------------*/
   // BUTTON SETUP
@@ -496,11 +604,28 @@ void setup() {
   button.setPressedState(LOW); // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
 
   // If the button is already held at boot (for example, when waking from
-  // deep sleep), ignore it until it has been released.
-  button.update();
+  // deep sleep, where the wake is caused by the press itself), ignore it until
+  // it has been released.
+  //
+  // A single update() immediately after attach() is not enough: Bounce2 must
+  // observe a stable reading for the full debounce interval before its state
+  // is trustworthy, so keep updating for longer than that interval.
+  Serial.printf("[boot] millis=%lu bootCount=%d digitalRead(button)=%d\n",
+                (unsigned long)millis(), bootCount, digitalRead(PUSH_BUTTON_PIN));
+  const unsigned long bootSampleStart = millis();
+  while (millis() - bootSampleStart < 50) {
+    button.update();
+    delay(5);
+  }
+  Serial.printf("[boot] after settle : isPressed=%d read()=%d\n",
+                (int)button.isPressed(), (int)button.read());
   if (button.isPressed()) {
     buttonPressHandled = true;
     buttonPressStartTime = millis();
+    Serial.printf("[boot] button already held - press ignored until released"
+                  " (start=%lu)\n", buttonPressStartTime);
+  } else {
+    Serial.println("[boot] button not held at boot");
   }
 
 
@@ -771,6 +896,7 @@ void setup() {
 
 unsigned long last_update = 0;
 char buffer[64];
+
 void loop()
 {
     // YOU MUST CALL THIS EVERY LOOP
@@ -786,18 +912,28 @@ void loop()
     if (button.pressed()) {
         buttonPressStartTime = millis();
         buttonPressHandled = false;
-        Serial.println("Button pressed");
+        Serial.printf("[btn] pressed at millis=%lu (handled reset)\n",
+                      (unsigned long)millis());
     }
 
     // Long press: enter deep sleep.
     if (button.isPressed() && !buttonPressHandled &&
         (millis() - buttonPressStartTime >= LONG_PRESS_MS)) {
         buttonPressHandled = true;
-        Serial.println("Button held for >2s - going to sleep");
+        Serial.printf("[btn] long press at millis=%lu (held %lu ms), pin=%d"
+                      " - blanking display and waiting for release before sleeping\n",
+                      (unsigned long)millis(),
+                      (unsigned long)(millis() - buttonPressStartTime),
+                      digitalRead(PUSH_BUTTON_PIN));
         enterDeepSleep();
     }
 
     if (button.released()) {
+        Serial.printf("[btn] released at millis=%lu (buttonPressHandled=%d)"
+                      " -> %s\n",
+                      (unsigned long)millis(), (int)buttonPressHandled,
+                      buttonPressHandled ? "long press already handled"
+                                         : "treated as SHORT press (mode change)");
         if (!buttonPressHandled) {
             // Short press: cycle display mode
             buttonPressHandled = true;
@@ -859,13 +995,18 @@ void updateClockWithAnimation() {
             memset(buffer, 0, 64);
             snprintf(buffer, 64, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 
-            Serial.println("Performing screen time update...");
             dma_display->fillRect(0, 9, PANEL_RES_X * PANEL_CHAIN, 9, 0x00); // wipe the section of the screen just used for the time
             dma_display->setCursor(8, 10);
             dma_display->setTextColor(dma_display->color565(255, 255, 255));
             dma_display->print(buffer);
         } else {
-            Serial.println("Failed to get time from all sources.");
+            // Rate-limited: a blocking USB CDC write every second on the display
+            // refresh path causes a visible hitch.
+            static unsigned long lastNoTimeLogMs = 0;
+            if ((millis() - lastNoTimeLogMs) >= RTC_POLL_INTERVAL_MS) {
+                lastNoTimeLogMs = millis();
+                Serial.println("Failed to get time from all sources.");
+            }
             // Display error indicator
             dma_display->fillRect(0, 9, PANEL_RES_X, 9, 0x00);
             dma_display->setCursor(8, 10);
@@ -946,9 +1087,14 @@ void updateClockOnly() {
             dma_display->setTextColor(dma_display->color565(150, 150, 255));
             dma_display->print(days[wday]);
 
-            Serial.println("Clock-only mode update");
+            // No per-second Serial output here: a blocking USB CDC write on the
+            // display refresh path causes a visible hitch.
         } else {
-            Serial.println("Failed to get time from all sources.");
+            static unsigned long lastNoTimeLogMs = 0;
+            if ((millis() - lastNoTimeLogMs) >= RTC_POLL_INTERVAL_MS) {
+                lastNoTimeLogMs = millis();
+                Serial.println("Failed to get time from all sources.");
+            }
             dma_display->clearScreen();
             dma_display->setCursor(8, 10);
             dma_display->setTextColor(dma_display->color565(255, 0, 0));
