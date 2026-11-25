@@ -18,10 +18,10 @@ WiFi credentials are not stored in source control. Copy the template and fill in
 your own values:
 
 ```
-copy src/secrets.h.example src/secrets.h
+copy src/wf1wf2demo/secrets.h.example src/wf1wf2demo/secrets.h
 ```
 
-`src/secrets.h` is git-ignored. If it is missing the sketch still compiles using
+`src/wf1wf2demo/secrets.h` is git-ignored. If it is missing the sketch still compiles using
 the `xxxx` / `yyyy` placeholders, but it will stay offline.
 
 The timezone is set with a POSIX TZ string in the sketch
@@ -58,6 +58,8 @@ Alternatively, solder a micro-usb to the exposed pins underneath to gain access 
 
 The above has been successfully tested on board is rev 7.0.1-1 and it comes with an ESP32-S2 with 4MB flash and no PS Ram.
 
+> **Note (Serial Monitor):** If you are using the Arduino IDE, ensure `Tools -> USB CDC On Boot -> Enabled` is selected so that `Serial` output is routed over the USB-A port after boot. This is already enabled by default in `platformio.ini` via `-DARDUINO_USB_CDC_ON_BOOT=1`.
+
 ## Huidu WF2
 
 HD-WF2 boards are easily flashed with USB-A to USB-C cables often used with phone chargers, so no need to look for rare USB-A to USB-A cables. You just need to plug type-c port to you laptop's type-c port (or some USB hub with type-c) and plug USB-A to the board, voila... :)
@@ -66,7 +68,7 @@ The best fit board definition for PlatformIO is:
 
 `board = wifiduino32s3`
 
-and if you need serial debug messages via USB-A port just add
+Serial debug messages via the USB-A port are enabled by default in `platformio.ini` via:
 
 ```
 build_flags =
